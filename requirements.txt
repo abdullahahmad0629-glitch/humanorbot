@@ -1,9 +1,3 @@
-numpy
 pandas
 scikit-learn
-nltk
-torch
-transformers
-datasets
-matplotlib
-jupyter
+joblib
