@@ -1,63 +1,65 @@
-"""Step 1: load, clean and split the data.
+"""
+preprocess.py - loading, cleaning and splitting the data.
 
-Both models use the SAME train/test split (fixed seed), so the comparison is fair.
+Both models (the base model and the fine-tuned model) use the SAME
+train/test split, so they are tested on exactly the same texts.
 
-Usage (prints a summary of the dataset, useful for the report):
+Run directly to print dataset statistics for the report:
     python src/preprocess.py --data data/sample.csv
 """
+
 import argparse
 import re
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-SEED = 42
-LABEL_COLUMNS = ["label", "generated"]  # different Kaggle datasets use different names
-LABEL_NAMES = {0: "human", 1: "ai"}
+SEED = 42          # fixed seed so the split is identical every run
+TEST_SIZE = 0.2    # 80% train / 20% held-out test
 
 
 def clean_text(text):
-    """Remove links and extra whitespace. Case and punctuation are kept on purpose:
-    DistilBERT handles them itself, and they are useful clues for both models."""
+    """Remove links and extra whitespace.
+    Case and punctuation are kept on purpose: they are useful clues."""
     text = str(text)
-    text = re.sub(r"http\S+|www\.\S+", " ", text)
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"http\S+|www\.\S+", " ", text)   # remove links
+    text = re.sub(r"\s+", " ", text)                 # collapse whitespace
     return text.strip()
 
 
 def load_data(path, max_rows=None):
-    """Read a CSV with a 'text' column and a 'label' or 'generated' column
-    (0 = human, 1 = AI). Optionally keep a random, class-balanced subset."""
+    """Read a CSV with a 'text' column and a 'label' or 'generated' column.
+    label: 0 = human, 1 = AI.
+    max_rows: optionally take a smaller, class-balanced sample (for quick runs)."""
     df = pd.read_csv(path)
-    label_col = next((c for c in LABEL_COLUMNS if c in df.columns), None)
-    if "text" not in df.columns or label_col is None:
-        raise ValueError(f"CSV needs a 'text' column and one of {LABEL_COLUMNS}; found {list(df.columns)}")
 
-    df = df[["text", label_col]].rename(columns={label_col: "label"}).dropna()
+    # The Kaggle dataset calls the label column 'generated'
+    if "label" not in df.columns and "generated" in df.columns:
+        df = df.rename(columns={"generated": "label"})
+
+    df = df[["text", "label"]].dropna()
     df["text"] = df["text"].apply(clean_text)
-    df = df[df["text"].str.len() > 0].drop_duplicates("text")
     df["label"] = df["label"].astype(int)
+    df = df[df["text"] != ""]
+    df = df.drop_duplicates(subset="text").reset_index(drop=True)
 
-    if max_rows and len(df) > max_rows:
-        df, _ = train_test_split(df, train_size=max_rows, random_state=SEED, stratify=df["label"])
-    return df.reset_index(drop=True)
+    if max_rows is not None and max_rows < len(df):
+        # take the same number of rows from each class
+        per_class = max_rows // 2
+        parts = []
+        for label in [0, 1]:
+            rows = df[df["label"] == label]
+            parts.append(rows.sample(min(per_class, len(rows)), random_state=SEED))
+        df = pd.concat(parts).reset_index(drop=True)
+    return df
 
 
-def split_data(df, test_size=0.2):
-    """80/20 stratified split, identical every run."""
-    train, test = train_test_split(df, test_size=test_size, random_state=SEED, stratify=df["label"])
-    return train.reset_index(drop=True), test.reset_index(drop=True)
-
-
-def describe(df):
-    counts = df["label"].map(LABEL_NAMES).value_counts()
-    words = df["text"].str.split().str.len()
-    print(f"Rows: {len(df)}")
-    for name, n in counts.items():
-        print(f"  {name}: {n} ({n / len(df):.1%})")
-    print(f"Words per text: mean {words.mean():.0f}, median {words.median():.0f}, max {words.max()}")
-    for label, name in LABEL_NAMES.items():
-        print(f"  avg words ({name}): {words[df['label'] == label].mean():.0f}")
+def split_data(df):
+    """Stratified 80/20 split. Same result every run (seed 42)."""
+    train_df, test_df = train_test_split(
+        df, test_size=TEST_SIZE, random_state=SEED, stratify=df["label"]
+    )
+    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
 
 if __name__ == "__main__":
@@ -66,7 +68,12 @@ if __name__ == "__main__":
     parser.add_argument("--max-rows", type=int, default=None)
     args = parser.parse_args()
 
-    data = load_data(args.data, args.max_rows)
-    describe(data)
-    train, test = split_data(data)
-    print(f"Train: {len(train)}  Test: {len(test)}")
+    df = load_data(args.data, args.max_rows)
+    train_df, test_df = split_data(df)
+
+    print(f"Total rows: {len(df)}")
+    print(f"Human (0): {(df['label'] == 0).sum()}   AI (1): {(df['label'] == 1).sum()}")
+    print(f"Train: {len(train_df)}   Test: {len(test_df)}")
+    words = df["text"].str.split().str.len()
+    print(f"Average words - human: {words[df['label'] == 0].mean():.1f}, "
+          f"AI: {words[df['label'] == 1].mean():.1f}")
