@@ -1,6 +1,5 @@
 """
 train.py - Base model vs. LoRA fine-tuned model for AI-text detection.
-(This version: BASE MODEL evaluation only. LoRA fine-tuning is added next.)
 
 Steps:
   1. Load the data and make the fixed 80/20 split (preprocess.py).
@@ -20,7 +19,7 @@ How we get a probability:
 Kaggle (GPU T4/P100, Internet ON):
     python src/train.py --data /kaggle/input/<dataset>/<file>.csv --max-rows 10000
 Quick test:
-    python src/train.py --data data/sample.csv --max-rows 2000
+    python src/train.py --data data/sample.csv --max-rows 2000 --epochs 1
 """
 
 import argparse
@@ -30,9 +29,11 @@ import time
 
 import numpy as np
 import torch
+from peft import LoraConfig, get_peft_model
 from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
                              precision_score, recall_score, roc_auc_score)
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                          get_linear_schedule_with_warmup)
 
 from preprocess import SEED, load_data, split_data
 
@@ -152,6 +153,70 @@ def print_comparison(results):
 
 
 # ---------------------------------------------------------------------------
+# Fine-tuning with LoRA
+# ---------------------------------------------------------------------------
+
+def add_lora(model, r):
+    """Freeze the 1.5B original weights and add small trainable LoRA matrices
+    to the attention layers."""
+    config = LoraConfig(
+        r=r,                       # rank of the LoRA matrices
+        lora_alpha=2 * r,          # scaling factor
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
+    model.print_trainable_parameters()
+    return model
+
+
+def finetune(model, tokenizer, train_df, args, device):
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()     # saves GPU memory (slightly slower)
+    model.enable_input_require_grads()        # needed for gradient checkpointing + LoRA
+    model = add_lora(model, args.lora_r)
+
+    texts = train_df["text"].tolist()
+    labels = torch.tensor(train_df["label"].values)
+    steps_per_epoch = (len(texts) + args.batch_size - 1) // args.batch_size
+    total_steps = steps_per_epoch * args.epochs
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
+    scheduler = get_linear_schedule_with_warmup(optimizer, int(0.1 * total_steps), total_steps)
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    rng = np.random.default_rng(SEED)
+    step = 0
+    for epoch in range(args.epochs):
+        model.train()
+        order = rng.permutation(len(texts))      # shuffle each epoch
+        for start in range(0, len(texts), args.batch_size):
+            idx = order[start:start + args.batch_size]
+            prompts = make_prompts(tokenizer, [texts[i] for i in idx], args.max_len)
+            y = labels[idx].to(device)
+
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(device == "cuda")):
+                logits = answer_logits(model, tokenizer, prompts, device)
+            loss = loss_fn(logits.float(), y)
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            step += 1
+            if step % 50 == 0 or step == total_steps:
+                print(f"epoch {epoch + 1}  step {step}/{total_steps}  loss {loss.item():.4f}")
+    return model
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -161,8 +226,11 @@ def main():
     parser.add_argument("--out", default="outputs")
     parser.add_argument("--model-name", default=MODEL_NAME)
     parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-len", type=int, default=256, help="max tokens of each text")
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lora-r", type=int, default=16)
     args = parser.parse_args()
 
     torch.manual_seed(SEED)
@@ -187,6 +255,22 @@ def main():
     results["base"] = evaluate(y_test, base_probs)
     results["base"]["seconds"] = time.time() - t0
 
+    # 3. Fine-tune with LoRA
+    print("\nFine-tuning with LoRA...")
+    t0 = time.time()
+    model = finetune(model, tokenizer, train_df, args, device)
+    train_seconds = time.time() - t0
+    model.save_pretrained(os.path.join(args.out, "lora_adapter"))
+    tokenizer.save_pretrained(os.path.join(args.out, "lora_adapter"))
+
+    # 4. Fine-tuned model
+    print("\nEvaluating the FINE-TUNED model...")
+    t0 = time.time()
+    ft_probs = predict_ai_prob(model, tokenizer, test_texts, args.max_len, args.batch_size * 2, device)
+    results["finetuned"] = evaluate(y_test, ft_probs)
+    results["finetuned"]["seconds"] = time.time() - t0
+    results["finetuned"]["training_seconds"] = train_seconds
+
     # 5. Save everything
     with open(os.path.join(args.out, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
@@ -194,10 +278,12 @@ def main():
     # Every test text with both models' P(AI): used for the
     # false positive / false negative analysis in the report.
     test_df["base_ai_prob"] = base_probs
+    test_df["finetuned_ai_prob"] = ft_probs
     test_df.to_csv(os.path.join(args.out, "test_predictions.csv"), index=False)
 
     print_comparison(results)
-    print(f"Saved results.json and test_predictions.csv in '{args.out}/'")
+    print(f"\nFine-tuning took {train_seconds / 60:.1f} minutes.")
+    print(f"Saved results.json, test_predictions.csv and lora_adapter/ in '{args.out}/'")
 
 
 if __name__ == "__main__":
