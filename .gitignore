@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Data and models (too large for git)
+data/raw/*
+data/processed/*
+!data/**/.gitkeep
+models/*
+!models/.gitkeep
+*.pt
+*.bin
+*.safetensors
+*.pkl
+*.h5
+
+# Secrets and editor files
+.env
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
